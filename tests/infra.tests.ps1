@@ -188,8 +188,11 @@ try {
         $file = Join-Path $temporary "$($fixture.Name).bicepparam"
         Set-Content $file ("using '../main.bicep'`n" + $fixture.Body)
         $parametersFile = Join-Path $temporary "$($fixture.Name).json"
+        $previousExitCode = $LASTEXITCODE
         $result = & az bicep build-params --file $file --outfile $parametersFile 2>&1
         Assert-True (($LASTEXITCODE -eq 0) -eq $fixture.Valid) "Unexpected parameter compilation for $($fixture.Name): $result"
+        # Expected compiler rejections must not become the pwsh -Command runner's exit status.
+        $global:LASTEXITCODE = $previousExitCode
         if ($fixture.Valid) {
             $inputParameters = Get-Content $parametersFile -Raw | ConvertFrom-Json -AsHashtable
             Test-DeploymentParameters $inputParameters.parameters $template
