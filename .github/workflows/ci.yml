@@ -1,0 +1,30 @@
+name: Validate Bedrock solution
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+    - name: Install Bicep
+      run: az bicep install
+    - name: Infrastructure contracts
+      shell: pwsh
+      run: ./tests/infra.tests.ps1
+    - name: Management and startup tests
+      shell: pwsh
+      run: ./tests/scripts.tests.ps1
+    - name: Existing deployment adoption tests
+      shell: pwsh
+      run: ./tests/adoption.tests.ps1
+    - name: Monitoring tests
+      run: dotnet test tests/functions/functions.tests.csproj --verbosity quiet
+    - name: Build monitoring package
+      run: dotnet publish functions/functions.csproj --configuration Release --output "${{ runner.temp }}/functions" --verbosity quiet

@@ -1,44 +1,25 @@
 #!/usr/bin/env pwsh
-<# 
-.SYNOPSIS 
-    Grants access to given AAD user/service principal name
-#> 
 #Requires -Version 7
-
-. (Join-Path $PSScriptRoot functions.ps1)
-
-if (!(Get-Command func -ErrorAction SilentlyContinue)) {
-    Write-Warning "Azure Function Tools not found, exiting..."
-    exit
-}
-if (!(Get-Command dotnet -ErrorAction SilentlyContinue)) {
-    Write-Warning ".NET (Core) SDK not found, exiting..."
-    exit
-}
-
+param(
+    [string]$ResourceGroup = $env:AZURE_RESOURCE_GROUP,
+    [string]$DeploymentName = "minecraft-bedrock"
+)
+$ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "functions.ps1")
+Set-DeploymentContext -ResourceGroup $ResourceGroup -DeploymentName $DeploymentName
+$functionNames = @(Get-DeploymentOutput "function_name")
+if ($functionNames.Count -eq 0) { throw "No monitoring functions found in deployment outputs." }
+$temporary = Join-Path ([System.IO.Path]::GetTempPath()) "bedrock-functions-$([guid]::NewGuid())"
+$null = New-Item $temporary -ItemType Directory
 try {
-    $tfdirectory=$(Join-Path (Split-Path -Parent -Path $PSScriptRoot) "terraform")
-    Push-Location $tfdirectory
-    AzLogin
-    
-    $functionNames = (Get-TerraformOutput -OutputVariable "function_name" -ComplexType)  
-    if (!($functionNames)) {
-        Write-Warning "Azure Function not found, has infrastructure been provisioned?"
-        exit
+    $publish = Join-Path $temporary "publish"
+    dotnet publish (Join-Path $PSScriptRoot ".." "functions" "functions.csproj") --configuration Release --output $publish --verbosity quiet
+    if ($LASTEXITCODE -ne 0) { throw "Monitoring function build failed ($LASTEXITCODE)." }
+    $zip = Join-Path $temporary "functions.zip"
+    Compress-Archive -Path (Join-Path $publish "*") -DestinationPath $zip
+    foreach ($name in $functionNames) {
+        Write-Host "Publishing monitoring code to '$name'..."
+        $null = Invoke-AzCli -Arguments @("functionapp", "deployment", "source", "config-zip", "--resource-group", $ResourceGroup,
+            "--name", $name, "--src", $zip, "--subscription", (Get-DeploymentOutput "subscription_guid"), "--output", "none")
     }
-    $subscriptionID = (Get-TerraformOutput "subscription_guid")
-    az account set -s $subscriptionID # Required as func ignores --subscription
-
-    $functionDirectory=$(Join-Path (Split-Path -Parent -Path $PSScriptRoot) "functions")
-    Push-Location $functionDirectory
-
-    foreach ($functionName in $functionNames) {
-        Write-Host "`nFetching settings for function ${functionName}..."
-        func azure functionapp fetch-app-settings $functionName --subscription $subscriptionID
-        Write-Host "`nPublishing to function ${functionName}..."
-        func azure functionapp publish $functionName -b local --subscription $subscriptionID
-    }
-    Pop-Location
-} finally {
-    Pop-Location
-}
+} finally { Remove-Item -LiteralPath $temporary -Recurse -Force }

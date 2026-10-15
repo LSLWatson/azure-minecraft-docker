@@ -1,202 +1,64 @@
 #!/usr/bin/env pwsh
-
-<# 
-.SYNOPSIS 
-    Deploys Azure resources using Terraform
- 
-#> 
 #Requires -Version 7
-
-### Arguments
-param ( 
-    [parameter(Mandatory=$false,HelpMessage="Initialize Terraform backend, modules & provider")][switch]$Init=$false,
-    [parameter(Mandatory=$false,HelpMessage="Perform Terraform plan stage")][switch]$Plan=$false,
-    [parameter(Mandatory=$false,HelpMessage="Perform Terraform validate stage")][switch]$Validate=$false,
-    [parameter(Mandatory=$false,HelpMessage="Perform Terraform apply stage (implies plan)")][switch]$Apply=$false,
-    [parameter(Mandatory=$false,HelpMessage="Perform Terraform destroy stage")][switch]$Destroy=$false,
-    [parameter(Mandatory=$false,HelpMessage="Show Terraform output variables")][switch]$Output=$false,
-    [parameter(Mandatory=$false,HelpMessage="Grace period before server will be shut down for replacement")][int]$GracePeriodSeconds=30,
-    [parameter(Mandatory=$false,HelpMessage="Don't show prompts unless something get's deleted that should not be")][switch]$Force=$false,
-    [parameter(Mandatory=$false,HelpMessage="Initialize Terraform backend, upgrade modules & provider")][switch]$Upgrade=$false,
-    [parameter(mandatory=$false,HelpMessage="Follow Minecraft log that will be displayed after apply")][switch]$Follow,
-    [parameter(Mandatory=$false,HelpMessage="Don't deploy application artifacts (e.g. function used as Watchdog). Does not control Minecraft container pull")][switch]$NoCode=$false,
-    [parameter(Mandatory=$false,HelpMessage="Tear down infrastructure using Azure CLI")][switch]$TearDown=$false
-) 
-
-
-### Internal Functions
-. (Join-Path $PSScriptRoot functions.ps1)
-
-### Validation
-if (!(Get-Command terraform -ErrorAction SilentlyContinue)) {
-    $tfMissingMessage = "Terraform not found"
-    if ($IsWindows) {
-        $tfMissingMessage += "`nInstall Terraform e.g. from Chocolatey (https://chocolatey.org/packages/terraform) 'choco install terraform'"
-    } else {
-        $tfMissingMessage += "`nInstall Terraform e.g. using tfenv (https://github.com/tfutils/tfenv)"
-    }
-    throw $tfMissingMessage
-}
-
-Write-Information $MyInvocation.line 
-$script:ErrorActionPreference = "Stop"
-
-$workspace    = Get-TerraformWorkspace
-$planFile     = "${workspace}.tfplan".ToLower()
-$varsFile     = "${workspace}.tfvars".ToLower()
-$inAutomation = ($env:TF_IN_AUTOMATION -ieq "true")
-if (!$inAutomation -and $Force) {
-    if ($workspace -ieq "prod") {
-        $Force = $false
-        Write-Warning "Ignoring -Force in workspace '${workspace}'"
-    }
-    if ($Destroy -or $TearDown) {
-        $Force = $false
-        Write-Warning "Ignoring -Force on destroy"
-    }
-}
-
+param(
+    [string]$ResourceGroup = $env:AZURE_RESOURCE_GROUP,
+    [string]$DeploymentName = "minecraft-bedrock",
+    [string]$ParameterFile = (Join-Path $PSScriptRoot ".." "infra" "config.bicepparam"),
+    [ValidateSet("Build", "WhatIf", "Apply")][string]$Mode = "WhatIf",
+    [switch]$ApproveChanges,
+    [switch]$SkipFunctionPublish
+)
+$ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "functions.ps1")
+$template = Join-Path $PSScriptRoot ".." "infra" "main.bicep"
+$temporary = Join-Path ([System.IO.Path]::GetTempPath()) "bedrock-deploy-$([guid]::NewGuid())"
+$null = New-Item $temporary -ItemType Directory
 try {
-    $tfdirectory = (Get-TerraformDirectory)
-    Push-Location $tfdirectory
-    AzLogin -DisplayMessages
-    # Print version info
-    terraform -version
-
-    if ($Init -or $Upgrade) {
-        if (!$NoBackend) {
-            $backendFile = (Join-Path $tfdirectory backend.tf)
-            $backendTemplate = "${backendFile}.sample"
-            $newBackend = (!(Test-Path $backendFile))
-            $tfbackendArgs = ""
-            if ($newBackend) {
-                if (!$env:TF_STATE_backend_storage_account -or !$env:TF_STATE_backend_storage_container) {
-                    Write-Warning "Environment variables TF_STATE_backend_storage_account and TF_STATE_backend_storage_container must be set when creating a new backend from $backendTemplate"
-                    $fail = $true
-                }
-                if (!($env:TF_STATE_backend_resource_group -or $env:ARM_ACCESS_KEY -or $env:ARM_SAS_TOKEN)) {
-                    Write-Warning "Environment variables ARM_ACCESS_KEY or ARM_SAS_TOKEN or TF_STATE_backend_resource_group (with $identity granted 'Storage Blob Data Contributor' role) must be set when creating a new backend from $backendTemplate"
-                    $fail = $true
-                }
-                if ($fail) {
-                    Write-Warning "This script assumes Terraform backend exists at ${backendFile}, but it does not exist"
-                    Write-Host "You can copy ${backendTemplate} -> ${backendFile} and configure a storage account manually"
-                    Write-Host "See documentation at https://www.terraform.io/docs/backends/types/azurerm.html"
-                    exit
-                }
-
-                # Terraform azurerm backend does not exist, create one
-                Write-Host "Creating '$backendFile'"
-                Copy-Item -Path $backendTemplate -Destination $backendFile
-                
-                $tfbackendArgs += " -reconfigure"
-            }
-
-            if ($env:TF_STATE_backend_resource_group) {
-                $tfbackendArgs += " -backend-config=`"resource_group_name=${env:TF_STATE_backend_resource_group}`""
-            }
-            if ($env:TF_STATE_backend_storage_account) {
-                $tfbackendArgs += " -backend-config=`"storage_account_name=${env:TF_STATE_backend_storage_account}`""
-            }
-            if ($env:TF_STATE_backend_storage_container) {
-                $tfbackendArgs += " -backend-config=`"container_name=${env:TF_STATE_backend_storage_container}`""
-            }
+    $compiled = Join-Path $temporary "main.json"
+    $compiledParameters = Join-Path $temporary "parameters.json"
+    $null = Invoke-AzCli -Arguments @("bicep", "build", "--file", $template, "--outfile", $compiled)
+    if (!(Test-Path $ParameterFile -PathType Leaf)) { throw "Parameter file '$ParameterFile' is missing. Copy infra/config.example.bicepparam or run export_existing.ps1." }
+    if ([IO.Path]::GetExtension($ParameterFile) -eq ".bicepparam") {
+        $null = Invoke-AzCli -Arguments @("bicep", "build-params", "--file", $ParameterFile, "--outfile", $compiledParameters)
+    } elseif ([IO.Path]::GetExtension($ParameterFile) -eq ".json") {
+        Copy-Item $ParameterFile $compiledParameters
+    } else { throw "ParameterFile must be .bicepparam or ARM parameters .json." }
+    $parameters = Get-Content $compiledParameters -Raw | ConvertFrom-Json -AsHashtable
+    $definition = Get-Content $compiled -Raw | ConvertFrom-Json -AsHashtable
+    $script:DeploymentResourceGroup = $ResourceGroup
+    Test-DeploymentParameters $parameters.parameters $definition
+    if ($Mode -eq "Build") { Write-Host "Bicep template and parameters compiled; configuration is valid."; return }
+    Set-DeploymentContext -ResourceGroup $ResourceGroup -DeploymentName $DeploymentName
+    AzLogin
+    $null = Invoke-AzCli -Arguments @("group", "show", "--name", $ResourceGroup, "--output", "none")
+    $arguments = @("--resource-group", $ResourceGroup, "--name", $DeploymentName, "--mode", "Incremental",
+        "--template-file", $compiled, "--parameters", "@$compiledParameters")
+    $null = Invoke-AzCli -Arguments (@("deployment", "group", "validate") + $arguments + @("--output", "none"))
+    # ResourceIdOnly deliberately avoids displaying resolved mount keys or connection strings.
+    $preview = Invoke-AzCli -Arguments (@("deployment", "group", "what-if") + $arguments +
+        @("--result-format", "ResourceIdOnly", "--no-pretty-print", "--output", "json")) -Json
+    if ($preview.status -ne "Succeeded") { throw "Azure what-if did not succeed: $($preview.error.message)" }
+    $preview.changes | Select-Object changeType, resourceId | Format-Table -AutoSize
+    if (@($preview.changes | Where-Object changeType -eq "Delete").Count -gt 0) {
+        throw "What-if proposes deletion. This deployment path never approves resource deletion."
+    }
+    if ($Mode -eq "WhatIf") { return }
+    if (!$ApproveChanges) {
+        $decision = Read-Host "Type the resource group name '$ResourceGroup' to apply the displayed changes"
+        if ($decision -cne $ResourceGroup) { throw "Deployment cancelled." }
+    }
+    if (!$SkipFunctionPublish -and !(Get-Command dotnet -ErrorAction SilentlyContinue)) { throw ".NET SDK is required to publish monitoring code." }
+    $null = Invoke-AzCli -Arguments (@("deployment", "group", "create") + $arguments + @("--output", "none"))
+    Set-DeploymentContext -ResourceGroup $ResourceGroup -DeploymentName $DeploymentName
+    if (@(Get-DeploymentOutput "minecraft").Count -gt 0) {
+        if (!$SkipFunctionPublish) {
+            & (Join-Path $PSScriptRoot "deploy_functions.ps1") -ResourceGroup $ResourceGroup -DeploymentName $DeploymentName
         }
-
-        $initCmd = "terraform init $tfbackendArgs"
-        if ($Upgrade) {
-            $initCmd += " -upgrade"
-        }
-        Invoke "$initCmd" 
+        $null = WaitFor-MinecraftServer
+    } else {
+        Write-Host "No Bedrock instances configured; only shared infrastructure was deployed. Omitted existing instances remain in Azure."
     }
-
-    if ($Validate) {
-        Invoke "terraform validate" 
-    }
-    
-    # Prepare common arguments
-    if ($Force) {
-        $forceArgs = "-auto-approve"
-    }
-
-    if ($Apply) {
-        # Migrate to module structure before creating plan
-        Migrate-StorageShareState
-    }
-
-    if ($Plan -or $Apply) {
-        if (Test-Path $varsFile) {
-            # Load variables from file, if it exists and environment variables have not been set
-            $varArgs = " -var-file='$varsFile'"
-            $userEmailAddress = $(az account show --query "user.name" -o tsv)
-        }
-        if ($userEmailAddress -match "@") {
-            $varArgs += " -var 'provisoner_email_address=${userEmailAddress}'"
-        }
-
-        # Create plan
-        Invoke "terraform plan $varArgs -out='$planFile'"
-    }
-
-    if ($Apply) {
-        Validate-Plan -File $planFile
-
-        # Terraform Apply
-        Invoke "terraform apply $forceArgs '$planFile'"
-
-        # Deploy Azure Function
-        if (!$NoCode) {
-            $functionScript = (Join-Path $PSScriptRoot "deploy_functions.ps1")
-            Write-Information "Invoking ${functionScript}"
-            & $functionScript
-        }
-
-        # Start Minecraft
-        $null = WaitFor-MinecraftServer -Timeout 180 -Interval 10 -StartServer
-        if ($Follow) {
-            # Wait for Minecraft to boot up
-            Show-MinecraftLog -Tail
-        }
-    }
-
-    if ($Output) {
-        Invoke "terraform output"
-    }
-
-    if (($Apply -or $Output) -and ${env:GITHUB_WORKFLOW}) {
-        # Export Terraform output as step output
-        $terraformOutput = (terraform output -json | ConvertFrom-Json -AsHashtable)     
-        foreach ($key in $terraformOutput.Keys) {
-            $outputVariableValue = $terraformOutput[$key].value
-            Write-Output "${key}=${outputVariableValue}" >> $env:GITHUB_OUTPUT
-            Write-Output "TF_OUT_${key}=${outputVariableValue}" >> $env:GITHUB_ENV
-        } 
-    }
-    
-    if ($Destroy) {
-        if ($workspace -ieq "prod") {
-            Write-Error "You're about to delete Minecraft world data in workspace 'prod'!!! Please figure out another way of doing so, exiting..."
-            exit 
-        }
-
-        if ($env:TF_IN_AUTOMATION -ine "true") {
-            Write-Warning "If it exists, this will delete the Minecraft Server in workspace '${workspace}'!"
-            Invoke "terraform destroy $varArgs"
-        } else {
-            Invoke "terraform destroy $varArgs $forceArgs"
-        }
-    }
-
-    if ($TearDown) {
-        if ($env:TF_WORKSPACE -and ($env:TF_WORKSPACE -notmatch 'prod')) {
-            TearDown-Resources -All
-        } else {
-            Write-Warning "The following environment variable need to be set for teardown. Current value is: `nTF_WORKSPACE='${env:TF_WORKSPACE}'"
-            if ($env:TF_WORKSPACE -imatch 'prod') {
-                Write-Warning "Workspace ${env:TF_WORKSPACE} is not allowed!"
-            }
-        }
-    }
+    Write-Host "Deployment '$DeploymentName' completed. Dashboard: $(Get-DeploymentOutput 'dashboard_url')"
 } finally {
-    Pop-Location
+    Remove-Item -LiteralPath $temporary -Recurse -Force
 }

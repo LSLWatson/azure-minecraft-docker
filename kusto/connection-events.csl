@@ -1,6 +1,4 @@
-ContainerInstanceLog_CL 
-| where Message contains "connect" or Message contains "[/" 
-| extend MessageWithoutTimestamp=replace(@'\[[^\]]* (\w+)\]: ', @'[\1] ', Message)
-| extend Instance=tostring(split(ContainerGroup_s,'-')[-1])
+ContainerInstanceLog_CL
+| where Message contains "Player connected:" or Message contains "Player disconnected:"
 | order by TimeGenerated desc
-| project TimeGenerated, Instance, Message=tolower(MessageWithoutTimestamp)
+| project TimeGenerated, Instance=ContainerGroup_s, Message

@@ -1,120 +1,85 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
+using System.Net.Http;
+using System.Threading.Tasks;
 using Microsoft.ApplicationInsights;
 using Microsoft.ApplicationInsights.DataContracts;
 using Microsoft.ApplicationInsights.Extensibility;
 using Microsoft.Azure.WebJobs;
 using Microsoft.Extensions.Logging;
-using System.Net.Sockets;
-using System.Threading;
 
 namespace EW.Minecraft.Function
 {
     public class PingTest
     {
-        private const string TimerFormat = @"hh\:mm\:ss";
-        private const string MinecraftFqdnVariable = "MINECRAFT_FQDN";
-        private const string MinecraftPortVariable = "MINECRAFT_PORT";
+        private static readonly HttpClient Client = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
         private readonly TelemetryClient telemetryClient;
 
-        /// Using dependency injection will guarantee that you use the same configuration for telemetry collected automatically and manually.
         public PingTest(TelemetryConfiguration telemetryConfiguration)
         {
-            this.telemetryClient = new TelemetryClient(telemetryConfiguration);
-
-        }        
+            telemetryClient = new TelemetryClient(telemetryConfiguration);
+        }
 
         [FunctionName("PingTest")]
-        public void Run(
-            [TimerTrigger("0 */5 * * * *", RunOnStartup = false, UseMonitor = true)]TimerInfo timer,
-            ILogger log
-        )
+        public async Task Run(
+            [TimerTrigger("0 */5 * * * *", RunOnStartup = false, UseMonitor = true)] TimerInfo timer,
+            ILogger log)
         {
             if (timer.IsPastDue)
             {
                 log.LogInformation("Timer is running late!");
             }
-            log.LogInformation($"Start processing at: {DateTime.Now}");
-            bool success = false;
-            Stopwatch stopwatch = Stopwatch.StartNew();
 
-            try {
-                TcpClient client;
-                do {
-                    using (client = CreateClient()) {
-                        if (!client.Connected) {
-                            // HACK
-                            Thread.Sleep(500);
-                        }
-                    }
-                } 
-                while (!client.Connected && stopwatch.Elapsed.TotalSeconds < 30);
-                success = client.Connected;
-
-            }
-            catch (SocketException ex)
+            var stopwatch = Stopwatch.StartNew();
+            var properties = new Dictionary<string, string>
             {
-                log.LogError(ex,ex.Message);
+                ["Connected"] = "False",
+                ["Transport"] = "NetherNet"
+            };
 
-                success = false;
-            }
-            catch (Exception ex)
+            try
             {
-                log.LogCritical(ex,ex.Message);
-
-                // Rethrow exception
-                throw;
-            } 
-            finally 
+                var host = GetVariableValue("MINECRAFT_FQDN");
+                var port = int.Parse(GetVariableValue("MINECRAFT_PORT"));
+                var status = await BedrockStatus.GetAsync(Client, host, port);
+                properties["Connected"] = "True";
+                properties["Version"] = status.Version;
+                properties["Players"] = status.Players.ToString();
+                properties["MaxPlayers"] = status.MaxPlayers.ToString();
+                log.LogInformation("Bedrock {Version} responded in {Elapsed} ms ({Players}/{MaxPlayers} players).",
+                    status.Version, stopwatch.ElapsedMilliseconds, status.Players, status.MaxPlayers);
+            }
+            catch (HttpRequestException ex)
             {
-                var properties = new Dictionary<string,string>();
-                // properties.Add("ActivityId",System.Diagnostics.Activity.Current.TraceId.ToString());
-                properties.Add("Connected",success.ToString());
-                this.telemetryClient.TrackTrace("TestResult",SeverityLevel.Information,properties);                
-
-                string responseMessage;
-                if (success)
-                {
-                    responseMessage = String.Format("Minecraft Server connected in {0}",stopwatch.Elapsed.ToString(TimerFormat));
-                }
-                else 
-                {
-                    responseMessage = String.Format("Minecraft Server did not connect in {0}",stopwatch.Elapsed.ToString(TimerFormat));
-                }
-                log.LogInformation(responseMessage);
+                log.LogError(ex, "Bedrock signaling endpoint is inaccessible.");
             }
-        }
-
-        private static TcpClient CreateClient() {
-            string minecraftFQDN = GetVariableValue(MinecraftFqdnVariable);
-            int minecraftPort = Convert.ToInt32(GetVariableValue(MinecraftPortVariable));
-            TcpClient client = new System.Net.Sockets.TcpClient(minecraftFQDN, minecraftPort);
-
-            return client;
-        }
-
-        private static string FormatTimers(Dictionary<string, TimeSpan> timers) {
-            string result = String.Empty;
-
-            foreach (string snapshot in timers.Keys) {
-                TimeSpan timer = timers[snapshot];
-                string elapsed = timer.ToString(TimerFormat);
-                result += String.Format("\n{0}: {1}",snapshot,elapsed);
+            catch (TaskCanceledException ex)
+            {
+                log.LogError(ex, "Bedrock signaling request timed out.");
             }
-
-            return result;
+            catch (InvalidDataException ex)
+            {
+                log.LogError(ex, "Bedrock signaling endpoint returned invalid status.");
+            }
+            finally
+            {
+                telemetryClient.TrackTrace("TestResult",
+                    properties["Connected"] == "True" ? SeverityLevel.Information : SeverityLevel.Warning,
+                    properties);
+            }
         }
 
         private static string GetVariableValue(string variableName)
         {
-            string varableValue = Environment.GetEnvironmentVariable(variableName);
-            if (String.IsNullOrEmpty(varableValue)) {
-                throw new Exception(String.Format("Environment variable {0} not set",variableName));
+            var value = Environment.GetEnvironmentVariable(variableName);
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                throw new InvalidOperationException($"Environment variable {variableName} is not set.");
             }
 
-            return varableValue;
+            return value;
         }
-
     }
 }

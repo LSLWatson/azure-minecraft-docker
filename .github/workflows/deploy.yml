@@ -1,0 +1,51 @@
+name: Deploy Bedrock with Bicep
+on:
+  workflow_dispatch:
+    inputs:
+      resource_group:
+        description: Existing target resource group
+        required: true
+        type: string
+      parameter_file:
+        description: Reviewed parameter file in this repository
+        required: true
+        default: infra/config.example.bicepparam
+        type: string
+      environment:
+        description: GitHub environment with Azure OIDC configuration
+        required: true
+        type: choice
+        options: [dev, prod]
+      apply:
+        description: Apply changes (false previews only)
+        required: true
+        default: false
+        type: boolean
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: bedrock-${{ inputs.resource_group }}
+  cancel-in-progress: false
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    env:
+      AZURE_RESOURCE_GROUP: ${{ inputs.resource_group }}
+      PARAMETER_FILE: ${{ inputs.parameter_file }}
+      DEPLOY_MODE: ${{ inputs.apply && 'Apply' || 'WhatIf' }}
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+    - uses: azure/login@v2
+      with:
+        client-id: ${{ vars.AZURE_CLIENT_ID }}
+        tenant-id: ${{ vars.AZURE_TENANT_ID }}
+        subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+    - run: az bicep install
+    - name: Preview or apply incremental deployment
+      shell: pwsh
+      run: ./scripts/deploy.ps1 -ResourceGroup $env:AZURE_RESOURCE_GROUP -ParameterFile $env:PARAMETER_FILE -Mode $env:DEPLOY_MODE -ApproveChanges
