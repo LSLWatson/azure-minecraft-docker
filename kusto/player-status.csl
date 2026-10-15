@@ -1,13 +1,9 @@
-ContainerInstanceLog_CL 
-| where Message contains "lost connection: " or Message contains "logged in with entity" 
-| extend MessageWithoutTimestamp=replace(@'\[[^\]]* (\w+)\]: ', @'[\1] ', Message)
-| extend OnlinePlayer=extract(@'\]: *(\w+)', 1, Message)
-| extend User=extract(@'name=(\w+)', 1, Message)
-| extend Player=coalesce(User, OnlinePlayer)
-| extend DisconnectedStatus=extract(@'lost connection: *(.*)', 1, Message)
-| extend Status=coalesce(DisconnectedStatus, "Joined")
-| extend Instance=tostring(split(ContainerGroup_s,'-')[-1])
+ContainerInstanceLog_CL
+| where Message contains "Player connected:" or Message contains "Player disconnected:"
+| extend Player=extract(@"Player (?:connected|disconnected): (.*?), xuid:", 1, Message)
+| extend XUID=extract(@"xuid: ([0-9]+)", 1, Message)
+| extend Status=iff(Message contains "Player disconnected:", "Left", "Joined")
+| where isnotempty(Player) and isnotempty(XUID)
+| summarize arg_max(TimeGenerated, *) by ContainerGroup_s, XUID
 | order by TimeGenerated desc
-| summarize arg_max(TimeGenerated, *) by Player, Instance
-| order by TimeGenerated desc
-| project TimeGenerated, Instance, Player, Status
+| project TimeGenerated, Instance=ContainerGroup_s, Player, XUID, Status

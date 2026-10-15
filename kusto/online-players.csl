@@ -1,7 +1,13 @@
-ContainerInstanceLog_CL 
-| where Message contains "connect" or Message contains "[/" 
-| extend Player=extract(@'\]: *(\w+)',1, Message)
-| summarize JoinTime=maxif(TimeGenerated,Message contains "logged in with entity"), LeaveTime=maxif(TimeGenerated,Message contains "lost connection: ") by Player
-| where JoinTime > LeaveTime
-| order by JoinTime desc
-| project JoinTime, Player
+let Starts = ContainerEvent_CL
+| where Reason_s == "Started"
+| summarize LastStart=max(TimeGenerated) by ContainerGroup_s;
+ContainerInstanceLog_CL
+| where Message contains "Player connected:" or Message contains "Player disconnected:"
+| extend Player=extract(@"Player (?:connected|disconnected): (.*?), xuid:", 1, Message)
+| extend XUID=extract(@"xuid: ([0-9]+)", 1, Message)
+| where isnotempty(Player) and isnotempty(XUID)
+| summarize arg_max(TimeGenerated, *) by ContainerGroup_s, XUID
+| join kind=leftouter Starts on ContainerGroup_s
+| where Message contains "Player connected:" and (isnull(LastStart) or TimeGenerated >= LastStart)
+| order by TimeGenerated desc
+| project JoinTime=TimeGenerated, Instance=ContainerGroup_s, Player, XUID

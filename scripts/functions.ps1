@@ -1,642 +1,335 @@
-$repository   = 'azure-minecraft-docker'
+#Requires -Version 7
+$script:DeploymentResourceGroup = $env:AZURE_RESOURCE_GROUP
+$script:DeploymentContextName = if ($env:AZURE_DEPLOYMENT_NAME) { $env:AZURE_DEPLOYMENT_NAME } else { "minecraft-bedrock" }
+$script:DeploymentOutputs = $null
+$script:BedrockEnvironmentKeys = @("EULA", "VERSION", "SERVER_NAME", "GAMEMODE", "DIFFICULTY", "ALLOW_CHEATS", "ONLINE_MODE",
+    "LEVEL_NAME", "LEVEL_SEED", "LEVEL_TYPE", "VIEW_DISTANCE", "TICK_DISTANCE", "PLAYER_IDLE_TIMEOUT", "MAX_THREADS",
+    "DEFAULT_PLAYER_PERMISSION_LEVEL", "TEXTUREPACK_REQUIRED", "CONTENT_LOG_FILE_ENABLED", "CONTENT_LOG_CONSOLE_OUTPUT_ENABLED",
+    "CHAT_RESTRICTION", "MC_PACK", "FORCE_WORLD_COPY", "FORCE_PACK_COPY")
 
-function AzLogin (
-    [parameter(Mandatory=$false)][switch]$DisplayMessages=$false
-) {
-    # Are we logged into the wrong tenant?
-    Invoke-Command -ScriptBlock {
-        $Private:ErrorActionPreference = "Continue"
-        if ($env:ARM_TENANT_ID) {
-            $script:loggedInTenantId = $(az account show --query tenantId -o tsv 2>$null)
-        }
+function Invoke-AzCli {
+    param([Parameter(Mandatory)][string[]]$Arguments, [switch]$Json)
+    $result = & az @Arguments --only-show-errors
+    if ($LASTEXITCODE -ne 0) {
+        throw "Azure CLI '$($Arguments[0]) $($Arguments[1])' failed with exit code $LASTEXITCODE."
     }
-    if ($loggedInTenantId -and ($loggedInTenantId -ine $env:ARM_TENANT_ID)) {
-        Write-Warning "Logged into tenant $loggedInTenantId instead of $env:ARM_TENANT_ID (`$env:ARM_TENANT_ID), logging off az session"
-        az logout -o none
+    if ($Json) {
+        return ($result | ConvertFrom-Json -AsHashtable -ErrorAction Stop)
     }
-
-    # Are we logged in?
-    $account = $null
-    az account show 2>$null | ConvertFrom-Json | Set-Variable account
-    # Set Azure CLI context
-    if (-not $account) {
-        if ($env:CODESPACES -ieq "true") {
-            $azLoginSwitches = "--use-device-code"
-        }
-        if ($env:ARM_TENANT_ID) {
-            az login -t $env:ARM_TENANT_ID -o none $($azLoginSwitches)
-        } else {
-            az login -o none $($azLoginSwitches)
-        }
-    }
-
-    if ($DisplayMessages) {
-        if ($env:ARM_SUBSCRIPTION_ID -or ($(az account list --query "length([])" -o tsv) -eq 1)) {
-            Write-Host "Using subscription '$(az account show --query "name" -o tsv)'"
-        } else {
-            if ($env:TF_IN_AUTOMATION -ine "true") {
-                # Active subscription may not be the desired one, prompt the user to select one
-                $subscriptions = (az account list --query "sort_by([].{id:id, name:name},&name)" -o json | ConvertFrom-Json) 
-                $index = 0
-                $subscriptions | Format-Table -Property @{name="index";expression={$script:index;$script:index+=1}}, id, name
-                Write-Host "Set `$env:ARM_SUBSCRIPTION_ID to the id of the subscription you want to use to prevent this prompt" -NoNewline
-
-                do {
-                    Write-Host "`nEnter the index # of the subscription you want Terraform to use: " -ForegroundColor Cyan -NoNewline
-                    $occurrence = Read-Host
-                } while (($occurrence -notmatch "^\d+$") -or ($occurrence -lt 1) -or ($occurrence -gt $subscriptions.Length))
-                $env:ARM_SUBSCRIPTION_ID = $subscriptions[$occurrence-1].id
-            
-                Write-Host "Using subscription '$($subscriptions[$occurrence-1].name)'" -ForegroundColor Yellow
-                Start-Sleep -Seconds 1
-            } else {
-                Write-Host "Using subscription '$(az account show --query "name" -o tsv)', set `$env:ARM_SUBSCRIPTION_ID if you want to use another one"
-            }
-        }
-    }
-
-    if ($env:ARM_SUBSCRIPTION_ID) {
-        az account set -s $env:ARM_SUBSCRIPTION_ID -o none
-    }
-
-    # Populate Terraform azurerm variables where possible
-    if ($userType -ine "user") {
-        # Pass on pipeline service principal credentials to Terraform
-        $env:ARM_CLIENT_ID       ??= $env:servicePrincipalId
-        $env:ARM_CLIENT_SECRET   ??= $env:servicePrincipalKey
-        $env:ARM_TENANT_ID       ??= $env:tenantId
-        # Get from Azure CLI context
-        $env:ARM_TENANT_ID       ??= $(az account show --query tenantId -o tsv)
-        $env:ARM_SUBSCRIPTION_ID ??= $(az account show --query id -o tsv)
-    }
-    # Variables for Terraform azurerm Storage backend
-    if (!$env:ARM_ACCESS_KEY -and !$env:ARM_SAS_TOKEN) {
-        if ($env:TF_VAR_backend_storage_account -and $env:TF_VAR_backend_storage_container) {
-            $env:ARM_SAS_TOKEN=$(az storage container generate-sas -n $env:TF_VAR_backend_storage_container --as-user --auth-mode login --account-name $env:TF_VAR_backend_storage_account --permissions acdlrw --expiry (Get-Date).AddDays(7).ToString("yyyy-MM-dd") -o tsv)
-        }
-    }
-}
-
-function Execute-MinecraftCommand (
-    [parameter(Mandatory=$false)][string]$Command,
-    [parameter(mandatory=$false)][switch]$ShowLog,
-    [parameter(mandatory=$false)][int]$SleepSeconds=0,
-    [parameter(mandatory=$false)][switch]$StartServer=$false,
-    [parameter(mandatory=$false)][string]$ConfigurationName="primary"
-) {
-    if (WaitFor-MinecraftServer -StartServer:$StartServer -ConfigurationName $ConfigurationName) {
-        try {
-            AzLogin
-            
-            $tfdirectory = $(Join-Path (Get-Item $PSScriptRoot).Parent.FullName "terraform")
-            Push-Location $tfdirectory
-            
-            $minecraftConfig  = (terraform output -json minecraft | ConvertFrom-Json -AsHashtable)
-            $minecraft        = $minecraftConfig[$ConfigurationName]
-            $containerGroupID = $minecraft.container_group_id
-            $serverFQDN       = $minecraft.minecraft_server_fqdn
-        
-            if (![string]::IsNullOrEmpty($containerGroupID)) {
-                $containerCommand = [string]::IsNullOrEmpty($Command) ? "rcon-cli" : "rcon-cli ${Command}"
-                Write-Host "Sending command '${containerCommand}' to server ${serverFQDN}..."
-                az container exec --ids $containerGroupID --exec-command "${containerCommand}" --container-name minecraft
-                if ($ShowLog) {
-                    az container logs --ids $containerGroupID
-                }
-                if ($SleepSeconds -gt 0) {
-                    Write-Host "Sleeping $SleepSeconds seconds..."
-                    Start-Sleep -Seconds $SleepSeconds 
-                    if ($ShowLog) {
-                        az container logs --ids $containerGroupID
-                    }
-                }
-            } else {
-                Write-Warning "Container Instance has not been created, nothing to do"
-                return 
-            } 
-        } finally {
-            Pop-Location
-        }
-    }
-}
-
-function Get-OnlineUsers (
-    [parameter(Mandatory=$false)][string]$Format="tsv"
-) {
-    $queryFile = (Join-Path (Get-Item $PSScriptRoot).Parent.FullName kusto ./online-players.csl)
-
-    $query = (Get-Content $queryFile -Raw)
-    $query = ($query -replace "`t|`n|`r","") # Remove linefeeds
-    $query = ($query -replace """","`'") # Replace double quotes for single quotes
-
-    Push-Location $(Join-Path (Get-Item $PSScriptRoot).Parent.FullName "terraform")
-    $workspaceGUID = Get-TerraformOutput "log_analytics_workspace_guid"
-    Pop-Location
-
-    Write-Information "Running query '${query}'..."
-    $result = (az monitor log-analytics query -w $workspaceGUID --analytics-query "${query}" --query "[].Player" -o $format)
-
     return $result
 }
 
-function Get-TerraformDirectory() {
-    $tfDirectory = (Join-Path (Get-Item $PSScriptRoot).Parent.FullName "terraform")
-    Write-Debug "Get-TerraformDirectory: $tfDirectory"
-    return $tfDirectory
-}
-
-function Get-TerraformOutput (
-    [parameter(Mandatory=$true)][string]$OutputVariable,
-    [parameter(Mandatory=$false)][switch]$ComplexType
-) {
-    Invoke-Command -ScriptBlock {
-        $Private:ErrorActionPreference    = "SilentlyContinue"
-        Write-Verbose "terraform output ${OutputVariable}: evaluating..."
-        if ($ComplexType) {
-            $result = $(terraform output -json $OutputVariable 2>$null)
-        } else {
-            $result = $(terraform output $OutputVariable 2>$null)
-            $result = (($result -replace '^"','') -replace '"$','') # Remove surrounding quotes (Terraform 0.14)
-        }
-        if ($result -match "\[\d+m") {
-            # Terraform warning, return null for missing output
-            Write-Verbose "terraform output ${OutputVariable}: `$null (${result})"
-            return $null
-        } else {
-            if ($ComplexType) {
-                $result = ($result | ConvertFrom-Json)  
-            }
-            Write-Verbose "terraform output ${OutputVariable}: ${result}"
-            return $result
-        }
+function AzLogin {
+    if ($env:AZURE_SUBSCRIPTION_ID) {
+        $null = Invoke-AzCli -Arguments @("account", "set", "--subscription", $env:AZURE_SUBSCRIPTION_ID)
+    }
+    $account = & az account show --output json --only-show-errors 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "Sign in with az login and select the intended subscription before continuing." }
+    $account = $account | ConvertFrom-Json
+    if ($env:AZURE_TENANT_ID -and $account.tenantId -ne $env:AZURE_TENANT_ID) {
+        throw "The active Azure tenant does not match AZURE_TENANT_ID."
     }
 }
 
-function Get-TerraformWorkspace() {
-    if ($env:TF_WORKSPACE) {
-        Write-Debug "Get-TerraformWorkspace: $($env:TF_WORKSPACE)"
-        return $env:TF_WORKSPACE
+function Set-DeploymentContext {
+    param(
+        [string]$ResourceGroup = $script:DeploymentResourceGroup,
+        [string]$DeploymentName = $script:DeploymentContextName
+    )
+    if ([string]::IsNullOrWhiteSpace($ResourceGroup)) {
+        throw "Specify -ResourceGroup or set AZURE_RESOURCE_GROUP."
     }
-
-    try {
-        Push-Location (Get-TerraformDirectory)
-        $workspace = $(terraform workspace show)
-    } finally {
-        Pop-Location
-    }
-
-    Write-Debug "Get-TerraformWorkspace: $workspace"
-    return $workspace
+    if ([string]::IsNullOrWhiteSpace($DeploymentName)) { throw "Specify a deployment name." }
+    $script:DeploymentResourceGroup = $ResourceGroup
+    $script:DeploymentContextName = $DeploymentName
+    $script:DeploymentOutputs = $null
 }
 
-function Import-TerraformResource ( 
-    [parameter(mandatory=$true)][string]$ResourceName,
-    [parameter(mandatory=$true)][string]$ResourceID
-) {
-    try {
-        Push-Location (Get-TerraformDirectory)
-        $ResourceName = ($ResourceName -replace "`"","`\`"")
-        $resourceInState = $(terraform state show $ResourceName 2>$null)
-        if ($resourceInState) {
-            Write-Warning "Resource $ResourceName already exists in Terraform state, skipping import"
-            return
-        }
-        Write-Host "Importing ${ResourceName}..."
-        terraform import $ResourceName $ResourceID
-    } finally {
-        Pop-Location
-    }
-}
-
-function Invoke (
-    [string]$cmd
-) {
-    Write-Host "`n$cmd" -ForegroundColor Green 
-    Invoke-Expression $cmd
-    Validate-ExitCode $cmd
-}
-
-function Migrate-StorageShareState (
-    [parameter(Mandatory=$false)][string]$ConfigurationName="primary",
-    [parameter(Mandatory=$false)][switch]$DryRun
-    
-) {
-    try {
-        $tfdirectory=$(Join-Path (Split-Path -Parent -Path $PSScriptRoot) "terraform")
-        Push-Location $tfdirectory
-    
-        if (terraform state list 2>$null) {
-            # Terraform state exists, perform inspection
-            $backupResources   = $(terraform state list | Select-String -Pattern "^azurerm_backup_protected_file_share.minecraft_data\[0\]")
-            $functionResources = $(terraform state list | Select-String -Pattern "^module.functions.azurerm_app_service_plan.functions")
-            $obsoleteResources = $(terraform state list | Select-String -Pattern "^azurerm_monitor_diagnostic_setting.*workflow")
-            $shareResources    = $(terraform state list | Select-String -Pattern "^azurerm_storage_share")    
-        }
-        if ($backupResources -or $functionResources -or $obsoleteResources -or $shareResources) {
-            Write-Warning "Terraform needs to move resources within its state, as resources have been modularized to accomodate multiple Minecraft instances running side-by-side. This will move resources within Terraform state, not within Azure."
-            $obsoleteResources | Write-Information
-            $backupResources   | Write-Information
-            $shareResources    | Write-Information
-            Write-Warning "Running 'terraform apply' without reconciling storage resources will delete Minecraft world data, deployment will abort without confirmation"
-            Write-Warning "Before confirming, verify whether you have set custom Terraform input variable values (e.g. through an .auto.tfvars file). You may need to adapt those to the new map structure, see variables.tf and config.auto.example.tfvars."
-            Write-Host "If you wish to proceed moving resources within Terraform state, please reply 'yes' - null or N aborts" -ForegroundColor Cyan
-            $proceedanswer = Read-Host 
-    
-            if ($proceedanswer -ne "yes") {
-                Write-Host "`nReply is not 'yes' - Aborting " -ForegroundColor Yellow
-                exit
-            }
-    
-            $moveArgs = $DryRun ? "-dry-run" : ""
-
-            foreach ($backupResource in $backupResources) {
-                $newbackupResource = ($backupResource -replace "\[0\]","[`"${ConfigurationName}`"]")
-                Write-Host "Processing '$backupResource' -> '$newbackupResource'"
-                $newBackupResourceEscaped = ($newbackupResource -replace "`"","`\`"")
-                Write-Verbose "Processing '$backupResource' -> '$newBackupResourceEscaped'"
-                terraform state mv $moveArgs $backupResource $newBackupResourceEscaped
-            }
-
-            foreach ($functionResource in $functionResources) {
-                $newFunctionResource = ($functionResource -replace "module.functions.","")
-                Write-Host "Processing '$functionResource' -> '$newFunctionResource'"
-                terraform state mv $moveArgs $functionResource $newFunctionResource
-            }
-
-            foreach ($obsoleteResource in $obsoleteResources) {
-                Write-Verbose "Processing '$obsoleteResource'"
-                if (!$DryRun) {
-                    terraform state rm $obsoleteResource
-                }
-            }   
-
-            foreach ($shareResource in $shareResources) {
-                $newShareResource = "module.minecraft[`"${ConfigurationName}`"].${shareResource}"
-                Write-Host "Processing '$shareResource' -> '$newShareResource'"
-                $newShareResourceEscaped = ($newShareResource -replace "`"","`\`"")
-                Write-Verbose "Processing '$shareResource' -> '$newShareResourceEscaped'"
-                terraform state mv $moveArgs $shareResource $newShareResourceEscaped
-            }
-        }
-    } finally {
-        Pop-Location
-    }
-}
-
-function Send-MinecraftMessage ( 
-    [parameter(mandatory=$true,position=0)][string]$Message,
-    [parameter(mandatory=$false)][switch]$ShowLog,
-    [parameter(mandatory=$false)][int]$SleepSeconds=0,
-    [parameter(mandatory=$false)][string]$ConfigurationName="primary"    
-) {
-    try {
+function Get-DeploymentOutputs {
+    if ($null -eq $script:DeploymentOutputs) {
+        Set-DeploymentContext
         AzLogin
-        
-        $tfdirectory = $(Join-Path (Get-Item $PSScriptRoot).Parent.FullName "terraform")
-        Push-Location $tfdirectory
-        
-        $minecraftConfig  = (terraform output -json minecraft | ConvertFrom-Json -AsHashtable)
-        $minecraft        = $minecraftConfig[$ConfigurationName]
-        $containerGroupID = $minecraft.container_group_id
-        $serverFQDN       = $minecraft.minecraft_server_fqdn
-        
-        if (![string]::IsNullOrEmpty($containerGroupID)) {
-            Write-Host "Sending message '${Message}' to server ${serverFQDN}..."
-            az container exec --ids $containerGroupID --exec-command "rcon-cli say ${Message}" --container-name minecraft
-            if ($ShowLog) {
-                az container logs --ids $containerGroupID
+        $deployment = Invoke-AzCli -Arguments @("deployment", "group", "show", "--resource-group", $script:DeploymentResourceGroup,
+            "--name", $script:DeploymentContextName, "--output", "json") -Json
+        if ($deployment.properties.provisioningState -ne "Succeeded" -or !$deployment.properties.outputs) {
+            throw "Deployment '$script:DeploymentContextName' has no successful outputs. Complete the deployment or select another successful deployment."
+        }
+        $script:DeploymentOutputs = $deployment.properties.outputs
+    }
+    return $script:DeploymentOutputs
+}
+
+function Get-DeploymentOutput {
+    param([Parameter(Mandatory)][string]$OutputVariable)
+    $outputs = Get-DeploymentOutputs
+    if (!$outputs.Contains($OutputVariable)) { throw "Deployment output '$OutputVariable' is missing." }
+    return $outputs[$OutputVariable].value
+}
+
+function Get-MinecraftConfig {
+    $config = @{}
+    foreach ($instance in @(Get-DeploymentOutput "minecraft")) {
+        $config[$instance.configuration_name] = $instance
+    }
+    if ($config.Count -eq 0) { throw "No Minecraft instances found in deployment outputs." }
+    return $config
+}
+
+function Get-MinecraftInstance {
+    param([string]$ConfigurationName = "primary")
+    $config = Get-MinecraftConfig
+    if (!$config.ContainsKey($ConfigurationName)) { throw "Unknown Minecraft configuration '$ConfigurationName'." }
+    return $config[$ConfigurationName]
+}
+
+function Test-BedrockConfiguration {
+    param([Parameter(Mandatory)][hashtable]$Parameters)
+    $users = @($Parameters.minecraftUsers.value ?? @())
+    $ops = @($Parameters.minecraftOps.value ?? @())
+    $members = @($Parameters.minecraftMembers.value ?? @())
+    foreach ($user in $users) {
+        if ($user -notmatch '^[^:,\r\n]+:[0-9]{16,}$') { throw "Allowlist entries must be Gamertag:XUID with a numeric Xbox XUID of at least 16 digits." }
+    }
+    foreach ($xuid in @($ops) + @($members)) {
+        if ($xuid -notmatch '^[0-9]{16,}$') { throw "Operators and members must be numeric Xbox XUID strings of at least 16 digits." }
+    }
+    $allowedXuids = @($users | ForEach-Object { ($_ -split ':')[1] })
+    foreach ($xuid in $ops) {
+        if ($xuid -notin $allowedXuids) { throw "Operator $xuid needs a matching Gamertag:XUID allowlist entry." }
+    }
+    $configurations = @($Parameters.minecraftConfig.value ?? @(@{ name = "primary" }))
+    $names = @()
+    $containers = @()
+    $shares = @()
+    $functionNames = @()
+    $functionStorageNames = @()
+    $dnsLabels = @()
+    $vanityLabels = @()
+    foreach ($config in $configurations) {
+        foreach ($key in $config.Keys) {
+            if ($null -eq $config[$key]) { throw "Configuration '$($config.name)' has a null $key; omit it to use the default." }
+        }
+        if ($config.name -notmatch '^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$' -or $config.name -in $names) {
+            throw "Instance names must be unique lowercase letters, numbers and internal hyphens (1-32 characters)."
+        }
+        $names += $config.name
+        $maxPlayers = $config.maxPlayers ?? 4
+        $serverPort = $config.serverPort ?? 19132
+        $udpStart = $config.udpPortStart ?? 19140
+        foreach ($number in @($maxPlayers, $serverPort, $udpStart)) {
+            if ($number -isnot [long] -and $number -isnot [int]) { throw "Player limits and ports must be integers." }
+        }
+        if ($maxPlayers -lt 1 -or $maxPlayers -gt 4) { throw "ACI supports only 1-4 Bedrock players per instance." }
+        if ($serverPort -lt 1 -or $serverPort -gt 65535 -or $udpStart -lt 1 -or ($udpStart + $maxPlayers - 1) -gt 65535) {
+            throw "TCP and UDP ports must fit within 1-65535."
+        }
+        foreach ($timeKey in @("startTime", "startTimeWeekend", "stopTime", "stopTimeWeekend")) {
+            if ($config.Contains($timeKey) -and $config[$timeKey] -ne "" -and $config[$timeKey] -notmatch '^([01][0-9]|2[0-3]):[0-5][0-9]$') {
+                throw "$timeKey must be HH:mm or empty to disable that schedule."
             }
-            if ($SleepSeconds -gt 0) {
-                Write-Host "Sleeping $SleepSeconds seconds..."
-                Start-Sleep -Seconds $SleepSeconds 
-                if ($ShowLog) {
-                    az container logs --ids $containerGroupID
-                }
+        }
+        if ($config.allowOpsOnly -and $ops.Count -eq 0) { throw "allowOpsOnly requires at least one operator." }
+        $containerName = $config.containerName ?? "$script:DeploymentResourceGroup-bedrock-$($config.name)".ToLowerInvariant()
+        $dnsLabel = $config.dnsNameLabel ?? $containerName
+        foreach ($name in @($containerName, $dnsLabel)) {
+            if ($name -notmatch '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$') {
+                throw "Container and DNS labels must be 1-63 lowercase letters, numbers and internal hyphens; supply explicit names for a long resource group name."
             }
-        } else {
-            Write-Warning "Container Instance has not been created, nothing to do"
-            return 
-        } 
-    } finally {
-        Pop-Location
+        }
+        if ($containerName -in $containers -or $dnsLabel -in $dnsLabels) { throw "Container names and DNS labels must be unique." }
+        $containers += $containerName
+        $dnsLabels += $dnsLabel
+        $suffix = $Parameters.resourceSuffix.value ?? "sssssssssss"
+        $defaultShare = if ($config.name -eq "primary") { "minecraft-aci-bedrock-data-$suffix" } else { "minecraft-aci-bedrock-$($config.name)-data-$suffix" }
+        $shareName = $config.dataShareName ?? $defaultShare
+        if ($shareName -notmatch '^[a-z0-9]([a-z0-9-]{1,61}[a-z0-9])$' -or $shareName -match '--' -or $shareName -in $shares) {
+            throw "World share names must be unique valid Azure Files names (3-63 characters); supply dataShareName for a long instance name."
+        }
+        $shares += $shareName
+        $functionName = $config.functionName ?? "$script:DeploymentResourceGroup-$($config.name)-ping-test".ToLowerInvariant()
+        if ($functionName.Length -gt 60 -or $functionName -notmatch '^[a-z0-9][a-z0-9-]*[a-z0-9]$' -or $functionName -in $functionNames) {
+            throw "Function names must be unique valid hostnames of at most 60 characters."
+        }
+        $functionNames += $functionName
+        if ($config.functionStorageAccountName -and $config.functionStorageAccountName -notmatch '^[a-z0-9]{3,24}$') {
+            throw "Function storage account names must contain 3-24 lowercase letters or numbers."
+        }
+        if ($config.functionStorageAccountName) {
+            if ($config.functionStorageAccountName -in $functionStorageNames) { throw "Each monitoring function needs a distinct host storage account." }
+            $functionStorageNames += $config.functionStorageAccountName
+        }
+        $vanityLabel = $config.vanityHostnamePrefix ?? $(if ($config.name -eq "primary") { "minecraft" } else { $config.name })
+        if ($Parameters.vanityDnsZoneId.value -and ($vanityLabel -in $vanityLabels -or $vanityLabel -notmatch '^[a-z0-9][a-z0-9-]*$')) {
+            throw "Vanity DNS prefixes must be unique valid labels."
+        }
+        $vanityLabels += $vanityLabel
+        foreach ($key in ($config.environmentVariables ?? @{}).Keys) {
+            if ($key -cnotin $script:BedrockEnvironmentKeys -or $config.environmentVariables[$key] -isnot [string]) {
+                throw "Unsupported or reserved Bedrock environment variable '$key'. Use typed instance settings for networking, player limits and permissions."
+            }
+        }
+    }
+    if ($Parameters.storageAccountName.value -and $Parameters.storageAccountName.value -notmatch '^[a-z0-9]{3,24}$') {
+        throw "World storage account names must contain 3-24 lowercase letters or numbers."
+    }
+    if ($Parameters.resourceSuffix.value -and $Parameters.resourceSuffix.value -notmatch '^[a-z0-9]{4,11}$') {
+        throw "resourceSuffix must contain 4-11 lowercase letters or numbers."
+    }
+    foreach ($principal in @($Parameters.solutionContributors.value) + @($Parameters.solutionOperators.value) + @($Parameters.solutionReaders.value)) {
+        if ($null -ne $principal -and $principal -notmatch '^[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$') { throw "Access principal IDs must be GUIDs." }
+    }
+    if ($Parameters.vanityDnsZoneId.value -and $Parameters.vanityDnsZoneId.value -notmatch '^/subscriptions/[^/]+/resourceGroups/[^/]+/providers/Microsoft.Network/dnsZones/[^/]+$') {
+        throw "vanityDnsZoneId must be an existing Azure DNS zone resource ID."
     }
 }
 
-function Show-MinecraftLog (
-    [parameter(mandatory=$false)][switch]$Tail
-) {
-    $containerGroupID = (Get-TerraformOutput "container_group_id")
-    $followExpression = $Tail ? "--follow" : ""
-
-    if (![string]::IsNullOrEmpty($containerGroupID)) {
-        az container logs --ids $containerGroupID $followExpression
-    } else {
-        Write-Warning "Container Instance has not been created, nothing to do"
-        return 
-    } 
+function Test-ParameterValue {
+    param($Value, [hashtable]$Schema, [hashtable]$Definitions, [string]$Path)
+    if ($Schema.Contains('$ref')) {
+        $Schema = $Definitions[($Schema['$ref'] -split '/')[-1]]
+    }
+    if ($null -eq $Value) {
+        if ($Schema.nullable) { return }
+        throw "$Path cannot be null."
+    }
+    $valid = switch ($Schema.type) {
+        "string" { $Value -is [string] }
+        "int" { $Value -is [long] -or $Value -is [int] }
+        "bool" { $Value -is [bool] }
+        "array" { $Value -is [array] }
+        "object" { $Value -is [hashtable] }
+        default { throw "Unsupported parameter schema type '$($Schema.type)' for $Path." }
+    }
+    if (!$valid) { throw "$Path must be $($Schema.type)." }
+    if ($Schema.Contains("allowedValues") -and $Value -cnotin $Schema.allowedValues) { throw "$Path is not an allowed value." }
+    if ($Schema.Contains("minValue") -and $Value -lt $Schema.minValue) { throw "$Path is below its minimum." }
+    if ($Schema.Contains("maxValue") -and $Value -gt $Schema.maxValue) { throw "$Path exceeds its maximum." }
+    if ($Schema.Contains("minLength") -and $Value.Length -lt $Schema.minLength) { throw "$Path is too short." }
+    if ($Schema.Contains("maxLength") -and $Value.Length -gt $Schema.maxLength) { throw "$Path is too long." }
+    if ($Schema.type -eq "array" -and $Schema.Contains("items")) {
+        foreach ($item in $Value) { Test-ParameterValue $item $Schema.items $Definitions "$Path[]" }
+    }
+    if ($Schema.type -eq "object" -and $Schema.Contains("properties")) {
+        foreach ($name in $Value.Keys) {
+            if ($Schema.properties.Contains($name)) { Test-ParameterValue $Value[$name] $Schema.properties[$name] $Definitions "$Path.$name" }
+            elseif ($Schema.additionalProperties -eq $false) { throw "Unknown property $Path.$name." }
+        }
+        foreach ($name in $Schema.properties.Keys) {
+            if (!$Value.Contains($name) -and !$Schema.properties[$name].nullable) { throw "$Path.$name is required." }
+        }
+    }
 }
 
-function TearDown-Resources (
-    [parameter(mandatory=$false)][switch]$All,
-    [parameter(mandatory=$false)][switch]$Backups,
-    [parameter(mandatory=$false)][switch]$Locks,
-    [parameter(mandatory=$false)][switch]$Resources,
-    [parameter(mandatory=$false)][switch]$State
-) {
+function Test-DeploymentParameters {
+    param([hashtable]$Parameters, [hashtable]$Template)
+    foreach ($name in $Parameters.Keys) {
+        if (!$Template.parameters.Contains($name)) { throw "Unknown Bicep parameter '$name'." }
+        if (!$Parameters[$name].Contains("value")) { throw "Parameter '$name' must have an explicit value." }
+        Test-ParameterValue $Parameters[$name].value $Template.parameters[$name] $Template.definitions $name
+    }
+    Test-BedrockConfiguration $Parameters
+}
+
+function Get-BedrockServerStatus {
+    param(
+        [Parameter(Mandatory)][string]$ServerFQDN,
+        [Parameter(Mandatory)][ValidateRange(1,65535)][int]$ServerPort,
+        [ValidateRange(1,300)][int]$TimeoutSeconds = 5
+    )
+    $client = [System.Net.Http.HttpClient]::new()
+    $client.Timeout = [TimeSpan]::FromSeconds($TimeoutSeconds)
     try {
-        $tfdirectory = $(Join-Path (Get-Item $PSScriptRoot).Parent.FullName "terraform")
-        Push-Location $tfdirectory
-
-        if ($env:TF_IN_AUTOMATION -ine "true") {
-            # Prompt to continue
-            $choices = @(
-                [System.Management.Automation.Host.ChoiceDescription]::new("&Continue", "Tear down resources")
-                [System.Management.Automation.Host.ChoiceDescription]::new("&Exit", "Abort teardown")
-            )
-            $decision = $Host.UI.PromptForChoice("Continue", "Do you wish to proceed tear down resources in workspace ${env:TF_WORKSPACE}?", $choices, 1)
-
-            if ($decision -eq 0) {
-                Write-Host "$($choices[$decision].HelpMessage)"
-            } else {
-                Write-Host "$($PSStyle.Formatting.Warning)$($choices[$decision].HelpMessage)$($PSStyle.Reset)"
-                exit                    
-            }
-        }
-        Invoke-Command -ScriptBlock {
-            $private:ErrorActionPreference = "Continue" # Try to complete as much as possible
-
-            # Build JMESPath expression
-            $tagCondition = "tags.repository == '${repository}' && tags.workspace == '${env:TF_WORKSPACE}'"
-            if ($env:GITHUB_RUN_ID) {
-                $tagCondition += " && tags.runid == '${env:GITHUB_RUN_ID}'"
-            }
-            $tagQuery = "[?${tagCondition}].id"
-            Write-Verbose "JMESPath: `"$tagQuery`""
-
-            # Remove resource locks (only the ones created by Terraform)
-            if ($All -or $Locks) {
-                $resourceLocksJSON = $(terraform output -json resource_locks 2>$null)
-                if ($resourceLocksJSON -and ($resourceLocksJSON -match "^\[.*\]$")) {
-                    $resourceLocks = ($resourceLocksJSON | ConvertFrom-JSON)
-                    Write-Host "Removing resource locks defined in Terraform state..."
-                    az resource lock delete --ids $resourceLocks -o none
-                }
-            }
-
-            $resourceGroupIDs = $(az group list --query "$tagQuery" -o tsv)
-            if ($resourceGroupIDs) {
-                foreach ($resourceGroupID in $resourceGroupIDs) {
-                    $resourceGroup = $resourceGroupID.Split("/")[-1]
-
-                    # Delete resource lock using naming convention, in case Terraform state already got erased
-                    $resourceLocks = $(az group lock list -g $resourceGroup --query "[?starts_with(name,'minecraftstor') && ends_with(name,'-lock')].id" -o tsv)
-                    if ($resourceLocks) {
-                        Write-Host "Removing resource locks named 'minecraftstor*-lock' in resource group '${resourceGroup}'..."
-                        az resource lock delete --ids $resourceLocks -o none
-                    }
-
-                    if ($All -or $Backups) {
-                        $backupVaultID = $(az backup vault list -g $resourceGroup --query "[].id" -o tsv)
-                        if ($backupVaultID) {
-                            $backupVault = $backupVaultID.Split("/")[-1]
-
-                            Write-Host "Disabling purge protection on backup vault '${backupVault}'..."
-                            az backup vault backup-properties set --ids $backupVaultID --soft-delete-feature-state Disable --query "properties" -o table
-
-                            $backupItemIDs = $(az backup item list -g $resourceGroup -v $backupVault --query "[].id" -o tsv)
-                            if ($backupItemIDs) {
-                                Write-Host "Removing backup items from backup vault '${backupVault}'..."
-                                az backup protection disable --ids $backupItemIDs --backup-management-type AzureStorage --workload-type AzureFileShare --delete-backup-data true --yes --query "[].properties.extendedInfo.propertyBag" -o table
-                            }
-
-                            $backupContainerIDs = $(az backup container list --resource-group $resourceGroup --vault-name $backupVault --backup-management-type AzureStorage --query "[].id" -o tsv)
-                            if ($backupContainerIDs) {
-                                Write-Host "Unregistering backup containers from vault '${backupVault}'..."
-                                az backup container unregister --backup-management-type AzureStorage --ids $backupContainerIDs --yes
-                            } else {
-                                Write-Information "No storage accounts found registered with vault '${backupVault}'"
-                            }
-                        } else {
-                            Write-Information "No backup vault found in resource group '${resourceGroup}'"
-                        }
-                    }
-                }
-                if ($All -or $Resources) {
-                    Write-Host "Removing resource group(s) identified by `"$tagQuery`"..."
-                    Write-Information "az resource delete --ids ${resourceGroupIDs}..."
-                    az resource delete --ids $resourceGroupIDs --verbose
-                }
-            } else {
-                Write-Host "Nothing to remove"
-            }
-
-            if ($All -or $Resources) {
-                $metadataQuery = $tagQuery -replace "tags\.","metadata."
-                Write-Verbose "JMESPath Metadata Query: $metadataQuery"
-                # Remove DNS records using tags expressed as record level metadata
-                Write-Host "Removing '${repository}' records from shared DNS zone (sync)..."
-                $dnsZones = $(az network dns zone list | ConvertFrom-Json)
-                foreach ($dnsZone in $dnsZones) {
-                    Write-Verbose "Processing zone '$($dnsZone.name)'..."
-                    $dnsResourceIDs = $(az network dns record-set list -g $dnsZone.resourceGroup -z $dnsZone.name --query "${metadataQuery}" -o tsv)
-                    if ($dnsResourceIDs) {
-                        Write-Information "Removing DNS records from zone '$($dnsZone.name)'..."
-                        az resource delete --ids $dnsResourceIDs -o none
-                    }
-                }
-            }
-
-            # Run this only when we have performed other Terraform activities
-            if ($All -or $State) {
-                $terraformState = (terraform state pull | ConvertFrom-Json)
-                if ($terraformState.resources) {
-                    Write-Host "Clearing Terraform state in workspace ${env:TF_WORKSPACE}..."
-                    $terraformState.outputs = New-Object PSObject # Empty output
-                    $terraformState.resources = @() # No resources
-                    $terraformState.serial++
-                    $terraformState | ConvertTo-Json | terraform state push -
-                } else {
-                    Write-Host "No resources in Terraform state in workspace ${env:TF_WORKSPACE}..."
-                }
-                terraform state pull  
-            }
-        }
-    } finally {
-        Pop-Location
-
-    }
-}
-
-function Validate-ExitCode (
-    [string]$cmd
-) {
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0) {
-        Write-Warning "'$cmd' exited with status $exitCode"
-        exit $exitCode
-    }
-}
-
-function Validate-Plan (
-    [parameter(Mandatory=$true)][string]$File
-) {
-    if (-not (Test-Path $File)) {
-        throw "Plan file '${File}' not found"
-    }
-    Write-Verbose "Converting $File into JSON so we can perform some inspection..."
-    $planJSON = (terraform show -json $File)
-    $defaultChoice = 0
-
-    # Validation
-    # Check whether key resources will be replaced
-    if (Get-Command jq -ErrorAction SilentlyContinue) {
-        $psNativeCommandArgumentPassingBackup = $PSNativeCommandArgumentPassing
+        $response = $client.GetAsync("http://${ServerFQDN}:${ServerPort}/v1/join").GetAwaiter().GetResult()
         try {
-            $PSNativeCommandArgumentPassing = "Legacy"
-            $containerGroupIDsToReplace = $planJSON | jq -r '.resource_changes[] | select(.address|endswith(\"azurerm_container_group.minecraft_server\"))    | select( any (.change.actions[];contains(\"delete\"))) | .change.before.id'
-            Validate-ExitCode "jq"
-            $serverFQDNIDsToReplace     = $planJSON | jq -r '.resource_changes[] | select(.address|endswith(\"azurerm_dns_cname_record.vanity_hostname[0]\")) | select( any (.change.actions[];contains(\"delete\"))) | .change.before.id'
-            Validate-ExitCode "jq"
-            $minecraftDataIDsToReplace  = $planJSON | jq -r '.resource_changes[] | select(.address|endswith(\"azurerm_storage_share.minecraft_share\"))       | select( any (.change.actions[];contains(\"delete\"))) | .change.before.id'
-            Validate-ExitCode "jq"
-        } finally {
-            $PSNativeCommandArgumentPassing = $psNativeCommandArgumentPassingBackup
-        }
-    } else {
-        Write-Warning "jq not found, plan validation skipped. Look at the plan carefully before approving"
-        if ($Force) {
-            $Force = $false
-            Write-Warning "Ignoring -Force"
-        }
-    }
-
-    if ($serverFQDNIDsToReplace) {
-        Write-Warning "You're about to change the Minecraft Server hostname in workspace '${workspace}'!!!"
-        $defaultChoice = 1
-    }
-
-    if ($minecraftDataIDsToReplace) {
-        $defaultChoice = 1
-        if ($workspace -ieq "prod") {
-            Write-Error "You're about to delete Minecraft world data in workspace '${workspace}'!!! Please figure out another way of doing so, exiting..."
-            Write-Information $minecraftDataIDsToReplace
-            exit 
-        }
-        Write-Warning "You're about to delete Minecraft world data in workspace '${workspace}'!!!"
-    }
-
-    if (!$inAutomation) {
-        Write-Debug "Container groups that will be replaced:`n${containerGroupIDsToReplace}"
-        if ($containerGroupIDsToReplace) {
-            Write-Verbose "Container groups that will be replaced:`n${containerGroupIDsToReplace}"
-            # --ids returns different JSON structure depending on the number of arguments, hence we need different JMESPath queries for single and multiple arguments
-            if ($containerGroupIDsToReplace -match " ") {
-                $runningContainerGroupIDsToReplace = $(az container show --ids $containerGroupIDsToReplace --query "[?containers[?name=='minecraft' && instanceView.currentState.state=='Running']].id" -o tsv)
-            } else {
-                $runningContainerGroupIDsToReplace = $(az container show --ids $containerGroupIDsToReplace --query "[{state:containers[?name=='minecraft'].instanceView.currentState.state | [0], id:id}] | @[?state=='Running'].id | [0]" -o tsv)
+            $null = $response.EnsureSuccessStatusCode()
+            $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            try { $status = $content | ConvertFrom-Json -ErrorAction Stop }
+            catch [System.ArgumentException] { throw [System.IO.InvalidDataException]::new("Bedrock returned invalid JSON.", $_.Exception) }
+            if ($status.name -isnot [string] -or $status.version -isnot [string] -or [string]::IsNullOrWhiteSpace($status.version) -or
+                $status.protocol -isnot [long] -or $status.protocol -le 0 -or
+                $status.players -isnot [long] -or $status.players -lt 0 -or
+                $status.maxPlayers -isnot [long] -or $status.maxPlayers -lt 1 -or $status.players -gt $status.maxPlayers) {
+                throw [System.IO.InvalidDataException]::new("Response is not valid Bedrock NetherNet server status.")
             }
-            if ($runningContainerGroupIDsToReplace) {
-                $defaultChoice = 1
-                Write-Warning "You're about to replace running Minecraft container(s) in workspace '${workspace}'!:`n${runningContainerGroupIDsToReplace}`nInform users so they can bail out."
-                if ($Force) {
-                    $Force = $false
-                    Write-Warning "Ignoring -Force"
-                }
-            }
-        } else {
-            Write-Verbose "Container groups will not be replaced"
-        }
+            return $status
+        } finally { $response.Dispose() }
+    } finally { $client.Dispose() }
+}
 
-        if (!$Force -or $containerGroupReplaced -or $minecraftDataReplaced) {
-            # Prompt to continue
-            $choices = @(
-                [System.Management.Automation.Host.ChoiceDescription]::new("&Continue", "Deploy infrastructure")
-                [System.Management.Automation.Host.ChoiceDescription]::new("&Exit", "Abort infrastructure deployment")
-            )
-            $decision = $Host.UI.PromptForChoice("Continue", "Do you wish to proceed executing Terraform plan $File in workspace $workspace?", $choices, $defaultChoice)
-
-            if ($decision -eq 0) {
-                Write-Host "$($choices[$decision].HelpMessage)"
-            } else {
-                Write-Host "$($PSStyle.Formatting.Warning)$($choices[$decision].HelpMessage)$($PSStyle.Reset)"
-                exit                    
+function WaitFor-MinecraftServer {
+    param(
+        [ValidateRange(1,3600)][int]$Timeout = 300,
+        [ValidateRange(1,1000)][int]$MaxTries = 50,
+        [ValidateRange(1,300)][int]$Interval = 10,
+        [switch]$StartServer,
+        [string]$ConfigurationName
+    )
+    $config = Get-MinecraftConfig
+    $names = if ($ConfigurationName) { @($ConfigurationName) } else { $config.Keys }
+    foreach ($name in $names) {
+        if (!$config.ContainsKey($name)) { throw "Unknown Minecraft configuration '$name'." }
+        $minecraft = $config[$name]
+        if ($StartServer) {
+            $state = Invoke-AzCli -Arguments @("container", "show", "--ids", $minecraft.container_group_id, "--query",
+                "containers[0].instanceView.currentState.state", "--output", "tsv")
+            if ($state -notin @("Running", "Waiting")) {
+                $null = Invoke-AzCli -Arguments @("container", "start", "--ids", $minecraft.container_group_id, "--output", "none")
             }
         }
+        $timer = [System.Diagnostics.Stopwatch]::StartNew()
+        $attempts = 0
+        do {
+            $attempts++
+            $status = $null
+            try {
+                $remaining = [Math]::Max(1, [Math]::Ceiling($Timeout - $timer.Elapsed.TotalSeconds))
+                $status = Get-BedrockServerStatus -ServerFQDN $minecraft.minecraft_server_fqdn -ServerPort $minecraft.minecraft_server_port -TimeoutSeconds ([Math]::Min(5, $remaining))
+            } catch [System.Net.Http.HttpRequestException], [System.Threading.Tasks.TaskCanceledException], [System.IO.InvalidDataException] {
+                Write-Warning "Bedrock status check failed: $($_.Exception.Message)"
+            }
+            if (!$status -and $timer.Elapsed.TotalSeconds -lt $Timeout -and $attempts -lt $MaxTries) {
+                Start-Sleep -Seconds ([Math]::Min($Interval, [Math]::Max(0, $Timeout - $timer.Elapsed.TotalSeconds)))
+            }
+        } while (!$status -and $timer.Elapsed.TotalSeconds -lt $Timeout -and $attempts -lt $MaxTries)
+        if (!$status) { throw "Bedrock did not respond at $($minecraft.minecraft_server_connection) after $attempts attempts." }
+        Write-Host "Bedrock $($status.version) at $($minecraft.minecraft_server_connection) ($($status.players)/$($status.maxPlayers) players)."
+    }
+    return $true
+}
+
+function Execute-MinecraftCommand {
+    param(
+        [string]$Command = "list", [switch]$ShowLog,
+        [ValidateRange(0,3600)][int]$SleepSeconds = 0,
+        [switch]$StartServer, [string]$ConfigurationName = "primary"
+    )
+    $null = WaitFor-MinecraftServer -StartServer:$StartServer -ConfigurationName $ConfigurationName
+    $minecraft = Get-MinecraftInstance $ConfigurationName
+    $null = Invoke-AzCli -Arguments @("container", "exec", "--ids", $minecraft.container_group_id,
+        "--container-name", "minecraft", "--exec-command", "send-command $Command")
+    if ($ShowLog) { Show-MinecraftLog -ConfigurationName $ConfigurationName }
+    if ($SleepSeconds -gt 0) {
+        Start-Sleep -Seconds $SleepSeconds
+        if ($ShowLog) { Show-MinecraftLog -ConfigurationName $ConfigurationName }
     }
 }
 
-function WaitFor-MinecraftServer (
-    [parameter(mandatory=$false)][int]$Timeout=300
-    ,
-    [parameter(mandatory=$false)][int]$MaxTries=50,
-    [parameter(mandatory=$false)][int]$Interval=10,
-    [parameter(mandatory=$false)][switch]$StartServer,
-    [parameter(mandatory=$false)][string]$ConfigurationName
-) {
-    try {
-        AzLogin
-        
-        $tfdirectory = $(Join-Path (Get-Item $PSScriptRoot).Parent.FullName "terraform")
-        Push-Location $tfdirectory
-        
-        # Cater for multiple servers
-        $minecraftConfig  = (terraform output -json minecraft_java | ConvertFrom-Json -AsHashtable)
-        Write-Debug "`$minecraftConfig: $minecraftConfig"
-        Write-Debug "`$minecraftConfig: $($minecraftConfig | ConvertTo-Json)"
-        $resourceGroup    = (Get-TerraformOutput "resource_group")
-        $subscriptionID   = (Get-TerraformOutput "subscription_guid")
+function Send-MinecraftMessage {
+    param([Parameter(Mandatory)][string]$Message, [switch]$ShowLog, [int]$SleepSeconds = 0, [string]$ConfigurationName = "primary")
+    Execute-MinecraftCommand -Command "say $Message" -ShowLog:$ShowLog -SleepSeconds $SleepSeconds -ConfigurationName $ConfigurationName
+}
 
-        if ($minecraftConfig) {
-            $configurations = $ConfigurationName ? @($ConfigurationName) : $minecraftConfig.Keys
-            foreach ($minecraftConfigName in $configurations) {
-                Write-Debug "`$minecraftConfigName: $minecraftConfigName"
-                $minecraft = $minecraftConfig[$minecraftConfigName]
-                Write-Debug "`$minecraft: $minecraft"
-                $containerGroupName = $minecraft.container_group_name
-                if ($StartServer) {
-                    Write-Host "Starting ${containerGroupName}..."
-                    # Workaround for issue https://github.com/Azure/azure-cli/issues/19530, still prevalent in Azure CLI 2.32
-                    az container show -n $containerGroupName -g $resourceGroup --subscription $subscriptionID --query "containers[0].instanceView.currentState.state" -o tsv | Set-Variable containerState
-                    Write-Verbose "containerState: $containerState"
-                    if (@("Running","Waiting") -icontains $containerState) {
-                        Write-Host "${containerGroupName} is already in state '${containerState}'"
-                    } else {
-                        Write-Verbose "az container start -n $containerGroupName -g $resourceGroup --subscription $subscriptionID"
-                        az container start -n $containerGroupName -g $resourceGroup --subscription $subscriptionID
-                        Write-Debug "Started ${containerGroupName}"    
-                    }
-                }
-    
-                $serverFQDN = $minecraft.minecraft_server_fqdn
-                $serverPort = $minecraft.minecraft_server_port
-                $timer = [system.diagnostics.stopwatch]::StartNew()
-                $connectionAttempts = 0
-                do {
-                    $connectionAttempts++
-                    try {
-                        Write-Host "Pinging ${serverFQDN} on port ${serverPort}..."
-                        $mineCraftConnection = New-Object System.Net.Sockets.TcpClient($serverFQDN, $serverPort) -ErrorAction SilentlyContinue
-                        if (!$mineCraftConnection.Connected) {
-                            Start-Sleep -Seconds $Interval
-                        }
-                    } catch [System.Management.Automation.MethodInvocationException] {
-                        Write-Verbose $_
-                    }
-                } while (!$mineCraftConnection.Connected -and ($timer.Elapsed.TotalSeconds -lt $Timeout) -and ($connectionAttempts -le $MaxTries))
-    
-                if ($mineCraftConnection.Connected) {
-                    Write-Host "Connected to ${serverFQDN}:${serverPort} in $($timer.Elapsed.TotalSeconds) seconds"
-                    $mineCraftConnection.Close()
-                } else {
-                    Write-Host "Could not connect to ${serverFQDN}:${serverPort}"
-                }
-            }
-            return $true
-        } else {
-            Write-Warning "Server(s) has not been created, nothing to do"
-            return $false
-        } 
-    } finally {
-        Pop-Location
-    }
+function Show-MinecraftLog {
+    param([switch]$Tail, [string]$ConfigurationName = "primary")
+    $minecraft = Get-MinecraftInstance $ConfigurationName
+    $arguments = @("container", "logs", "--ids", $minecraft.container_group_id, "--container-name", "minecraft")
+    if ($Tail) { $arguments += "--follow" }
+    Invoke-AzCli -Arguments $arguments
+}
+
+function Get-OnlineUsers {
+    param([ValidateSet("json", "tsv", "table")][string]$Format = "tsv")
+    $query = Get-Content (Join-Path (Split-Path $PSScriptRoot -Parent) "kusto" "online-players.csl") -Raw
+    Invoke-AzCli -Arguments @("monitor", "log-analytics", "query", "--workspace", (Get-DeploymentOutput "log_analytics_workspace_guid"),
+        "--analytics-query", $query, "--query", "[].Player", "--output", $Format)
 }

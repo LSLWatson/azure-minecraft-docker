@@ -1,6 +1,4 @@
-ContainerInstanceLog_CL 
-| where Message contains "lost connection: you are not whitelisted" 
-| extend MessageWithoutTimestamp=replace(@'\[[^\]]* (\w+)\]: ', @'[\1] ', Message)
-| extend User=extract(@'name=(\w+)',1, Message)
+ContainerInstanceLog_CL
+| where Message has_any ("allowlist", "allow-list") and Message has_any ("denied", "not", "failed", "refused")
 | order by TimeGenerated desc
-| project TimeGenerated, User, Message=tolower(MessageWithoutTimestamp)
+| project TimeGenerated, Instance=ContainerGroup_s, Message
